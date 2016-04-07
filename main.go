@@ -187,7 +187,7 @@ func register(w http.ResponseWriter, r *http.Request) {
 	c2.Opts = new(ClientOpts)
 	c2.Opts.Url = "http://" + c2.Ip + ":" + c2.Port
 	c2.Opts.Timeout = 1000 * time.Second
-	c2.illChannel = make(chan int)
+	c2.illChannel = make(chan int, 10)
 	c2.state = 0
 
 	//注册新的主机,或者修改旧的主机
@@ -205,19 +205,25 @@ func register(w http.ResponseWriter, r *http.Request) {
 
 		go func(c Client) {
 			go healthCheck(c)
-			for {
-				select {
-				case _ = <-c.illChannel:
-					mMap.Lock()
-					delete(clientMap, c.Ip+":"+c.Port)
-					mMap.Unlock()
-					runtime.Goexit()
-				default:
-					randTest(c)
-				}
-				//for test
-				time.Sleep(2 * time.Second)
+			//开启10个goroutine进行随机测试
+			for i := 0; i < 10; i++ {
+				go func(c Client) {
+					for {
+						select {
+						case _ = <-c.illChannel:
+							mMap.Lock()
+							delete(clientMap, c.Ip+":"+c.Port)
+							mMap.Unlock()
+							runtime.Goexit()
+						default:
+							randTest(c)
+						}
+						//for test
+						time.Sleep(2 * time.Second)
+					}
+				}(c)
 			}
+
 		}(*c2)
 	}()
 	return
@@ -470,12 +476,16 @@ func healthCheck(c Client) {
 	req, err := http.NewRequest(Get.Name, "http://"+c.Ip+":"+c.Port+"/ping", nil)
 	if err != nil {
 		log.Error(err)
-		c.illChannel <- 1
+		for i := 0; i < 10; i++ {
+			c.illChannel <- 1
+		}
 	}
 
 	_, err = client.Do(req)
 	if err != nil {
-		c.illChannel <- 1
+		for i := 0; i < 10; i++ {
+			c.illChannel <- 1
+		}
 	}
 }
 
@@ -573,7 +583,6 @@ func main() {
 	registry := NewRegisryClient()
 	go func(r RegistryClient) {
 		for {
-			//			log.Debugf("health check[%s]", r.Ip+":"+r.Port)
 			registryHealthCheck(r)
 			time.Sleep(3 * time.Second)
 		}
