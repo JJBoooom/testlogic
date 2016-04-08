@@ -1,0 +1,5 @@
+{
+   "images":[
+   {"name":"docker.io/registry","tag":"2.1.1"}
+   ]
+}
