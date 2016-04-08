@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -26,15 +27,17 @@ const (
 
 	working = 1
 	free    = 0
+
+	//默认产生的随机测试goroutine数
+	defaultRandNum = 10
 )
 
 var (
 	clientMap          = make(map[string]*Client) //map[ip]Client
-	mMap               = new(sync.RWMutex)
-	registerChannel    = make(chan Client)
+	mMap               = new(sync.RWMutex)        //用于同步clientMap访问
 	pushedMap          = make(map[string]int)
-	pMap               = new(sync.RWMutex)
-	actions            = []string{"pull", "push"}
+	pMap               = new(sync.RWMutex)        //用于同步pushedMap访问
+	actions            = []string{"pull", "push"} //执行的动作
 	log                = logrus.New()
 	HostJson           = "./host.json"
 	ImageJson          = "./image.json"
@@ -43,7 +46,7 @@ var (
 	appSoarRegistry    = "192.168.15.119"
 	appSoarPort        = "5000"
 	RegisterListenPort = "12345"
-	//repo名只支持小写
+	//repo名只支持小写, 用于随机产生repo名
 	letterRunes = []rune("abcdefghijklmnopqrstuvwxyz")
 )
 
@@ -59,10 +62,12 @@ type Client struct {
 	illChannel chan int
 }
 
+//访问registry server的客户端
 type RegistryClient struct {
 	Client
 }
 
+//镜像列表
 type Imagelist struct {
 	Images []Image `json:"images"`
 }
@@ -73,6 +78,23 @@ type Image struct {
 	state int
 }
 
+// 待完成
+// map[Push]Operation
+// map[]
+//[$time1 - $time2] $host $action $image, Result:Success
+//[$time1 - $time2] $host $action $image, Result:Fail, Reason
+
+type TestLog struct {
+	HostPort   string
+	Action     string
+	Msg        string //fail Msg
+	Result     bool   // 0 - success, 1 - fail
+	ImageTag   string
+	StartTime  time.Time
+	FinishTime time.Time
+}
+
+//推送存在于本地的镜像
 func pushImageExists(c2 Client) {
 	log.Debugf("%s:push image exists in local", c2.Ip)
 	list, err := c2.getImages()
@@ -97,7 +119,7 @@ func pushImageExists(c2 Client) {
 					err := c2.pushImage(j.Image)
 					iMap.Lock()
 					if err != nil {
-						log.Error(err)
+						log.Errorf("%s:fail to push local image to %s for %v:", c2.Ip, appSoarRegistry+":"+appSoarPort, err)
 						i.state = unpull
 					} else {
 						i.state = pushed
@@ -166,7 +188,7 @@ func pushImageNotExists(c2 Client) {
 				}
 			}
 		} else {
-			log.Debugf("%s: %s is pulling or pulled or pushed", c2.Ip, i.Name)
+			log.Infof("%s: %s is pulling or pulled or pushed", c2.Ip, i.Name)
 		}
 	}
 }
@@ -204,8 +226,8 @@ func register(w http.ResponseWriter, r *http.Request) {
 
 		go healthCheck(c2)
 		//开启10个goroutine进行随机测试
-		for i := 0; i < 10; i++ {
-			go func(i int, c Client) {
+		for i := 0; i < defaultRandNum; i++ {
+			go func(c Client) {
 				for {
 					select {
 					case _ = <-c.illChannel:
@@ -214,13 +236,12 @@ func register(w http.ResponseWriter, r *http.Request) {
 						mMap.Unlock()
 						runtime.Goexit()
 					default:
-						log.Debugf("%d:================>\n", i)
 						randTest(c)
 					}
 					//for test
 					time.Sleep(2 * time.Second)
 				}
-			}(i, c2)
+			}(c2)
 		}
 	}()
 	return
@@ -234,7 +255,7 @@ func (c Client) getImages() ([]ClientImageList, error) {
 	var apiImages []ClientImageList
 	resp, err := c.DoAction("/list", Get)
 	if err != nil {
-		log.Errorf("remote get image fail:%v", err)
+		log.Debugf("%s: get image fail:%v\n", c.Ip, err)
 		return []ClientImageList{}, err
 	}
 	defer func() {
@@ -244,11 +265,12 @@ func (c Client) getImages() ([]ClientImageList, error) {
 	}()
 	byteContent, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		log.Errorf("io read fail :%v", err)
+		log.Debugf("%s: get image fail for %v\n", c.Ip, err)
 		return []ClientImageList{}, err
 	}
 	err = json.Unmarshal(byteContent, &apiImages)
 	if err != nil {
+		log.Debugf("%s: get image fail for %v\n", c.Ip, err)
 		return []ClientImageList{}, errors.New("json unmarshal apiimage fail")
 	}
 
@@ -265,11 +287,11 @@ func (c Client) pullImage(imgTag string) error {
 	}
 	tag := slice1[len(slice1)-1]
 
-	log.Debugf("%s:pullImage:%v,tag:%v", c.Ip, img, tag)
+	log.Debugf("%s:pullImage:%v,tag:%v\n", c.Ip, img, tag)
 
 	resp, err := c.DoAction("/pull/"+img+"/"+tag, Get)
 	if err != nil {
-		log.Errorf("%s:pull Image[%s:%s] fail:%v", c.Ip, img, tag, err)
+		log.Debugf("%s:pull Image[%s:%s] fail:%v", c.Ip, img, tag, err)
 		return err
 	}
 	defer func() {
@@ -279,7 +301,7 @@ func (c Client) pullImage(imgTag string) error {
 	}()
 
 	if resp.StatusCode != http.StatusOK {
-		log.Errorf("%s:pull image[%s:%s] fail", c.Ip, img, tag)
+		log.Debugf("%s:pull image[%s:%s] fail\n", c.Ip, img, tag)
 		return errors.New("pull image fail:" + resp.Status)
 	}
 
@@ -303,6 +325,7 @@ func (c Client) pushImage(imgTag string) error {
 	log.Debugf("%s: url:%s", c.Ip, url)
 	resp, err := c.DoAction(url, Get)
 	if err != nil {
+		log.Debugf("%s: fail to push image[%s] for %v\n", c.Ip, imgTag, err)
 		return err
 	}
 	defer func() {
@@ -314,10 +337,9 @@ func (c Client) pushImage(imgTag string) error {
 	if resp.StatusCode == http.StatusOK {
 		pMap.Lock()
 		defer pMap.Unlock()
-		//pushedMap = append(pushedMap, img)
 		pushedMap[img+":"+tag] = 1
 	} else {
-		log.Errorf("%s:push image[%s:%s] fail", c.Ip, img, tag)
+		log.Debugf("%s:push image[%s:%s] fail\n", c.Ip, img, tag)
 		return errors.New("push image fail:" + resp.Status)
 		//record error
 	}
@@ -340,6 +362,7 @@ func (c Client) tagImage(imgTag string, new string) error {
 	url := "/tag"
 	resp, err := c.DoPost(url, byteData)
 	if err != nil {
+		log.Debugf("%s: fail to tag image[%s ==> %s] for %v", c.Ip, imgTag, new, err)
 		return err
 	}
 	defer func() {
@@ -353,7 +376,7 @@ func (c Client) tagImage(imgTag string, new string) error {
 		defer pMap.Unlock()
 	} else {
 		//record error
-		log.Errorf("%s:tag image[%s ==> %s] fail", c.Ip, imgTag, new)
+		log.Debugf("%s:fail to tag image[%s ==> %s] for %v ", c.Ip, imgTag, new, resp.Status)
 		return errors.New("tag fail:" + resp.Status)
 	}
 	return nil
@@ -379,7 +402,7 @@ func (c Client) pullImageFromPublic(imgTag string) error {
 	log.Debugf("%s:url:%s", c.Ip, url)
 	resp, err := c.DoAction(url, Get)
 	if err != nil {
-		log.Error(err)
+		log.Debugf("%s: fail to pull image[%s] from public for %v\n", c.Ip, imgTag, err)
 		return err
 	}
 	defer func() {
@@ -393,10 +416,10 @@ func (c Client) pullImageFromPublic(imgTag string) error {
 	} else {
 		byteContent, err := ioutil.ReadAll(resp.Body)
 		if err != nil {
-			log.Error(err)
+			log.Debug(err)
 			return err
 		} else {
-			log.Error(resp.StatusCode)
+			log.Debugf("%s: fail to pull image[%s] from public for %v\n", c.Ip, imgTag, resp.Status)
 			return errors.New(string(byteContent))
 		}
 	}
@@ -427,35 +450,35 @@ func randTest(client Client) error {
 			tag := slice1[len(slice1)-1]
 
 			newrepo := appSoarRegistry + ":" + appSoarPort + "/" + RandStringRunes(6) + "/" + RandStringRunes(7)
-			log.Debugf("%s: is push new image:%s:%s", client.Ip, newrepo, tag)
+			log.Infof("%s: is pushint new image[%s:%s]\n", client.Ip, newrepo, tag)
 			err := client.tagImage(image, newrepo+":"+tag)
 			if err != nil {
-				log.Errorf("%s: tag new image:%s:%s fail:%v", client.Ip, newrepo, tag, err)
+				log.Errorf("%s: push new image fail for tag new image[%s ==> %s:%s] fail:%v\n", client.Ip, image, newrepo, tag, err)
 				return err
 			}
 
 			err = client.pushImage(newrepo + ":" + tag)
 			if err != nil {
-				log.Debugf("%s: push new image:%s:%s fail:%v", client.Ip, newrepo, tag, err)
+				log.Errorf("%s: push new image[%s:%s] fail:%v\n", client.Ip, newrepo, tag, err)
 				return err
 			} else {
-				log.Debugf("%s: push new image:%s:%s success", client.Ip, newrepo, tag)
+				log.Infof("%s: push new image[%s:%s] success\n", client.Ip, newrepo, tag)
 
 			}
 			pMap.Lock()
 			pushedMap[newrepo+":"+tag] = 1
 			pMap.Unlock()
 		case "pull":
-			log.Debugf("%s: is pulling  image:%s", client.Ip, image)
+			log.Infof("%s: is pulling image:%s", client.Ip, image)
 			err := client.pullImage(image)
 			if err != nil {
-				log.Debugf("%s: is pulling  image:%s fail: %v", client.Ip, image, err)
+				log.Errorf("%s: pull image[%s] fail: %v\n", client.Ip, image, err)
 			} else {
-				log.Debugf("%s: is pulling  image:%s success", client.Ip, image)
+				log.Infof("%s: pull image[%s] success\n", client.Ip, image)
 			}
 
 		default:
-			log.Errorf("invalid action")
+			log.Errorf("%s:invalid action", client.Ip)
 		}
 	}
 	return nil
@@ -467,15 +490,16 @@ func healthCheck(c Client) {
 
 	req, err := http.NewRequest(Get.Name, "http://"+c.Ip+":"+c.Port+"/ping", nil)
 	if err != nil {
-		log.Error(err)
-		for i := 0; i < 10; i++ {
+		log.Errorf("%s health check fail for %v", c.Ip, err)
+		//让产生的10个goroutine自杀
+		for i := 0; i < defaultRandNum; i++ {
 			c.illChannel <- 1
 		}
 	}
 
 	_, err = client.Do(req)
 	if err != nil {
-		for i := 0; i < 10; i++ {
+		for i := 0; i < defaultRandNum; i++ {
 			c.illChannel <- 1
 		}
 	}
@@ -518,14 +542,25 @@ func RandStringRunes(n int) string {
 	b := make([]rune, n)
 	for i := range b {
 		b[i] = letterRunes[rand.Intn(len(letterRunes))]
-
 	}
 	return string(b)
 }
 
 func init() {
+
 	rand.Seed(time.Now().Unix())
-	log.Level = logrus.DebugLevel
+
+	log.Formatter = &logrus.TextFormatter{DisableColors: true}
+	logFile := "./autotest.log"
+	fp, err := os.OpenFile(logFile, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
+	if err != nil {
+		log.Errorf("Create logfile %s fail\n", logFile)
+		os.Exit(1)
+	}
+	//	defer fp.Close()
+	//logrus.SetOutput(fp)
+	log.Out = fp
+
 }
 
 func main() {
@@ -539,7 +574,7 @@ func main() {
 	var clients Clients
 	err = json.Unmarshal(strHost, &clients)
 	if err != nil {
-		log.Fatalf("json unmarshal fail:", err)
+		log.Fatalf("config remote host fail : unmarshal fail for ", err)
 	}
 
 	for _, v := range clients.Hosts {
@@ -554,19 +589,19 @@ func main() {
 	var ilist Imagelist
 	strImage, err := ioutil.ReadFile(ImageJson)
 	if err != nil {
-		log.Fatalf("config remote host fail:", err)
+		log.Fatalf("server start fail:", err)
 	}
 
 	log.Debug(string(strImage))
 
 	err = json.Unmarshal([]byte(strImage), &ilist)
 	if err != nil {
-		log.Fatalf("json unmarshal fail:", err)
+		log.Fatalf("server start fail: Image  unmarshal fail:", err)
 	}
 	log.Debug(ilist)
 
 	if len(ilist.Images) == 0 {
-		log.Fatalf("imageJson doesn't set any image data")
+		log.Fatalf("Server start fail: imageJson doesn't set any image data")
 	}
 
 	for _, i := range ilist.Images {
@@ -574,7 +609,7 @@ func main() {
 	}
 
 	//	registry healthy check
-	log.Info("start registry client, healthCheck")
+	log.Debugf("start registry client, healthCheck\n")
 	registry := NewRegisryClient()
 	go func(r RegistryClient) {
 		for {
@@ -587,13 +622,15 @@ func main() {
 		router := mux.NewRouter()
 		router.Methods("GET").Path("/register/{port:[0-9]*}").HandlerFunc(register)
 		router.Methods("GET").Path("/").HandlerFunc(hello)
-		log.Info("start register server")
+		log.Info("start register server, listen on " + RegisterListenPort)
 		err := http.ListenAndServe(":"+RegisterListenPort, router)
 		if err != nil {
+			log.Errorf("register server fail:%v", err)
 			panic(err)
 		}
 	}()
 
-	_ = <-registry.illChannel //阻塞主线程,registry健康监测失败才退出
+	//阻塞主线程,registry健康监测失败才退出
+	_ = <-registry.illChannel
 	log.Info("registry healthy check fail, exit...")
 }
