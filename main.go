@@ -43,7 +43,7 @@ var (
 	appSoarRegistry    = "192.168.15.119"
 	appSoarPort        = "5000"
 	RegisterListenPort = "12345"
-	//repo只能支持小写
+	//repo名只支持小写
 	letterRunes = []rune("abcdefghijklmnopqrstuvwxyz")
 )
 
@@ -57,8 +57,6 @@ type Client struct {
 	Port       string `json:"port"`
 	state      int    //0 - free, 1 - working
 	illChannel chan int
-	//	User       string `json:"user"`
-	//	Password   string `json:"password"`
 }
 
 type RegistryClient struct {
@@ -163,7 +161,7 @@ func pushImageNotExists(c2 Client) {
 					log.Errorf("%s:pulling from public fail:%v", c2.Ip, err)
 					iMap.Lock()
 					i.state = unpull
-
+					iMap.Unlock()
 					log.Error(err)
 				}
 			}
@@ -181,7 +179,8 @@ func register(w http.ResponseWriter, r *http.Request) {
 	log.Debug(port)
 	slice := strings.Split(r.RemoteAddr, ":")
 
-	c2 := new(Client)
+	//	c2 := new(Client)
+	var c2 Client
 	c2.Ip = slice[0]
 	c2.Port = port
 	c2.Opts = new(ClientOpts)
@@ -192,39 +191,37 @@ func register(w http.ResponseWriter, r *http.Request) {
 
 	//注册新的主机,或者修改旧的主机
 	mMap.Lock()
-	clientMap[c2.Ip+":"+c2.Port] = c2
+	clientMap[c2.Ip+":"+c2.Port] = &c2
 	mMap.Unlock()
 	//新注册的client开始先检测有没有镜像是处于unpull
 	//最好起个goroutine
 	//否则客户端一直得不到回应
 	go func() {
 		log.Debug("client prepare registry's environment")
-		pushImageExists(*c2)
+		pushImageExists(c2)
 		//可能还有未推送的,且不在本地的镜像
-		pushImageNotExists(*c2)
+		pushImageNotExists(c2)
 
-		go func(c Client) {
-			go healthCheck(c)
-			//开启10个goroutine进行随机测试
-			for i := 0; i < 10; i++ {
-				go func(c Client) {
-					for {
-						select {
-						case _ = <-c.illChannel:
-							mMap.Lock()
-							delete(clientMap, c.Ip+":"+c.Port)
-							mMap.Unlock()
-							runtime.Goexit()
-						default:
-							randTest(c)
-						}
-						//for test
-						time.Sleep(2 * time.Second)
+		go healthCheck(c2)
+		//开启10个goroutine进行随机测试
+		for i := 0; i < 10; i++ {
+			go func(i int, c Client) {
+				for {
+					select {
+					case _ = <-c.illChannel:
+						mMap.Lock()
+						delete(clientMap, c.Ip+":"+c.Port)
+						mMap.Unlock()
+						runtime.Goexit()
+					default:
+						log.Debugf("%d:================>\n", i)
+						randTest(c)
 					}
-				}(c)
-			}
-
-		}(*c2)
+					//for test
+					time.Sleep(2 * time.Second)
+				}
+			}(i, c2)
+		}
 	}()
 	return
 }
@@ -382,7 +379,7 @@ func (c Client) pullImageFromPublic(imgTag string) error {
 	log.Debugf("%s:url:%s", c.Ip, url)
 	resp, err := c.DoAction(url, Get)
 	if err != nil {
-		fmt.Println(err)
+		log.Error(err)
 		return err
 	}
 	defer func() {
@@ -396,27 +393,23 @@ func (c Client) pullImageFromPublic(imgTag string) error {
 	} else {
 		byteContent, err := ioutil.ReadAll(resp.Body)
 		if err != nil {
-			fmt.Println(err)
+			log.Error(err)
 			return err
 		} else {
-			fmt.Println(resp.StatusCode)
+			log.Error(resp.StatusCode)
 			return errors.New(string(byteContent))
 		}
 	}
 }
 
 func randTest(client Client) error {
-	//worker is free
 	log.Debugf("%s: start rand test....", client.Ip)
 	if client.state == 0 {
-
 		lPushedMap := len(pushedMap)
 		if lPushedMap == 0 {
 			log.Debugf("randtest without pushed image")
 			return errors.New("test without pushed image")
 		}
-
-		rand.Seed(time.Now().Unix())
 
 		iList := make([]string, lPushedMap)
 		i := 0
@@ -426,7 +419,6 @@ func randTest(client Client) error {
 		}
 		image := iList[rand.Intn(len(iList))]
 
-		rand.Seed(time.Now().Unix())
 		k := rand.Intn(len(actions))
 		switch actions[k] {
 		case "push":
@@ -434,11 +426,11 @@ func randTest(client Client) error {
 			slice1 := strings.Split(image, ":")
 			tag := slice1[len(slice1)-1]
 
-			newrepo := appSoarRegistry + ":" + appSoarPort + "/" + RandStringRunes(6) + "/" + RandStringRunes(12)
+			newrepo := appSoarRegistry + ":" + appSoarPort + "/" + RandStringRunes(6) + "/" + RandStringRunes(7)
 			log.Debugf("%s: is push new image:%s:%s", client.Ip, newrepo, tag)
 			err := client.tagImage(image, newrepo+":"+tag)
 			if err != nil {
-				log.Debugf("%s: tag new image:%s:%s fail:%v", client.Ip, newrepo, tag, err)
+				log.Errorf("%s: tag new image:%s:%s fail:%v", client.Ip, newrepo, tag, err)
 				return err
 			}
 
@@ -523,7 +515,6 @@ func NewRegisryClient() *RegistryClient {
 }
 
 func RandStringRunes(n int) string {
-	rand.Seed(time.Now().Unix())
 	b := make([]rune, n)
 	for i := range b {
 		b[i] = letterRunes[rand.Intn(len(letterRunes))]
@@ -532,8 +523,12 @@ func RandStringRunes(n int) string {
 	return string(b)
 }
 
-func main() {
+func init() {
+	rand.Seed(time.Now().Unix())
 	log.Level = logrus.DebugLevel
+}
+
+func main() {
 
 	strHost, err := ioutil.ReadFile(HostJson)
 	if err != nil {
@@ -600,5 +595,5 @@ func main() {
 	}()
 
 	_ = <-registry.illChannel //阻塞主线程,registry健康监测失败才退出
-	fmt.Println("registry healthy check fail, exit...")
+	log.Info("registry healthy check fail, exit...")
 }
