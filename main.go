@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io/ioutil"
 	"net/http"
@@ -33,7 +34,7 @@ const (
 )
 
 var (
-	clientMap          = make(map[string]*Client) //map[ip]Client
+	clientMap          = make(map[string]*Client) //map[ip]Client,移除?
 	mMap               = new(sync.RWMutex)        //用于同步clientMap访问
 	pushedMap          = make(map[string]int)
 	pMap               = new(sync.RWMutex)        //用于同步pushedMap访问
@@ -43,9 +44,9 @@ var (
 	ImageJson          = "./image.json"
 	imageMap           = make(map[string]*Image)
 	iMap               = new(sync.RWMutex)
-	appSoarRegistry    = "192.168.15.119"
-	appSoarPort        = "5000"
-	RegisterListenPort = "12345"
+	appSoarRegistry    string
+	appSoarPort        string
+	RegisterListenPort string
 	//repo名只支持小写, 用于随机产生repo名
 	letterRunes = []rune("abcdefghijklmnopqrstuvwxyz")
 )
@@ -76,22 +77,6 @@ type Image struct {
 	Name  string `json:"name"`
 	Tag   string `json:"tag"`
 	state int
-}
-
-// 待完成
-// map[Push]Operation
-// map[]
-//[$time1 - $time2] $host $action $image, Result:Success
-//[$time1 - $time2] $host $action $image, Result:Fail, Reason
-
-type TestLog struct {
-	HostPort   string
-	Action     string
-	Msg        string //fail Msg
-	Result     bool   // 0 - success, 1 - fail
-	ImageTag   string
-	StartTime  time.Time
-	FinishTime time.Time
 }
 
 //推送存在于本地的镜像
@@ -201,15 +186,15 @@ func register(w http.ResponseWriter, r *http.Request) {
 	log.Debug(port)
 	slice := strings.Split(r.RemoteAddr, ":")
 
-	//	c2 := new(Client)
+	//创建新的client object
 	var c2 Client
-	c2.Ip = slice[0]
-	c2.Port = port
+	c2.Ip = slice[0] //注册主机的IP
+	c2.Port = port   //注册主机通信端口
 	c2.Opts = new(ClientOpts)
 	c2.Opts.Url = "http://" + c2.Ip + ":" + c2.Port
-	c2.Opts.Timeout = 1000 * time.Second
-	c2.illChannel = make(chan int, 10)
-	c2.state = 0
+	c2.Opts.Timeout = 1000 * time.Second           //限制连接时长
+	c2.illChannel = make(chan int, defaultRandNum) //当主机health check失败后, 将通知启动的协程不再进行随机测试，自行销毁
+	c2.state = 0                                   //移除?
 
 	//注册新的主机,或者修改旧的主机
 	mMap.Lock()
@@ -247,6 +232,7 @@ func register(w http.ResponseWriter, r *http.Request) {
 	return
 }
 
+//解析客户端镜像列表
 type ClientImageList struct {
 	Image string `json:"image"`
 }
@@ -550,41 +536,30 @@ func init() {
 
 	rand.Seed(time.Now().Unix())
 
+	//flag.StringVar(&appSoarRegistry, "rip", "192.168.15.119", "registry ip")
+	//flag.StringVar(&appSoarPort, "rport", "5000", "registry port")
+	//flag.StringVar(&RegisterListenPort, "lport", "12345", "register server listen port")
+	flag.StringVar(&appSoarRegistry, "rip", "", "registry ip")
+	flag.StringVar(&appSoarPort, "rport", "", "registry port")
+	flag.StringVar(&RegisterListenPort, "lport", "", "register server listen port")
+	var logFile string
+	flag.StringVar(&logFile, "log", "./autotest.log", "log file path")
+	flag.Parse()
+	if len(appSoarRegistry) == 0 || len(appSoarPort) == 0 || len(RegisterListenPort) == 0 {
+		panic("invalid argument ")
+	}
+
 	log.Formatter = &logrus.TextFormatter{DisableColors: true}
-	logFile := "./autotest.log"
-	fp, err := os.OpenFile(logFile, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
+	fp, err := os.OpenFile(logFile, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644) // 让程序关闭后,自动释放
 	if err != nil {
 		log.Errorf("Create logfile %s fail\n", logFile)
 		os.Exit(1)
 	}
-	//	defer fp.Close()
-	//logrus.SetOutput(fp)
 	log.Out = fp
 
 }
 
 func main() {
-
-	strHost, err := ioutil.ReadFile(HostJson)
-	if err != nil {
-		log.Fatalf("config remote host fail:", err)
-	}
-	log.Debug(string(strHost))
-
-	var clients Clients
-	err = json.Unmarshal(strHost, &clients)
-	if err != nil {
-		log.Fatalf("config remote host fail : unmarshal fail for ", err)
-	}
-
-	for _, v := range clients.Hosts {
-		log.Debugf("%s:%s\n", v.Ip, v.Port)
-		mMap.Lock()
-		clientMap[v.Ip+":"+v.Port] = &v
-		mMap.Unlock()
-		//创建ill channel
-		v.illChannel = make(chan int)
-	}
 
 	var ilist Imagelist
 	strImage, err := ioutil.ReadFile(ImageJson)
