@@ -1,5 +1,10 @@
 {
    "images":[
-   {"name":"docker.io/registry","tag":"2.1.1"}
+   {"name":"registry","tag":"2.1.1"},
+   {"name":"mysql","tag":"5.6"},
+   {"name":"redis","tag":"latest"},
+   {"name":"haproxy","tag":"latest"},
+   {"name":"centos","tag":"latest"},
+   {"name":"rancher/agent","tag":"latest"}
    ]
 }
