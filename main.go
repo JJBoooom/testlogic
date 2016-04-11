@@ -26,11 +26,8 @@ const (
 	pulling = 1
 	unpull  = 0
 
-	working = 1
-	free    = 0
-
 	//默认产生的随机测试goroutine数
-	defaultRandNum = 10
+	defaultRandNum = 5
 )
 
 var (
@@ -40,7 +37,6 @@ var (
 	pMap               = new(sync.RWMutex)        //用于同步pushedMap访问
 	actions            = []string{"pull", "push"} //执行的动作
 	log                = logrus.New()
-	HostJson           = "./host.json"
 	ImageJson          = "./image.json"
 	imageMap           = make(map[string]Image)
 	iMap               = new(sync.RWMutex)
@@ -49,6 +45,7 @@ var (
 	RegisterListenPort string
 	//repo名只支持小写, 用于随机产生repo名
 	letterRunes = []rune("abcdefghijklmnopqrstuvwxyz")
+	limitNum    int
 )
 
 type Clients struct {
@@ -59,7 +56,6 @@ type Client struct {
 	BaseClient
 	Ip         string `json:"ip"`
 	Port       string `json:"port"`
-	state      int    //0 - free, 1 - working
 	illChannel chan int
 }
 
@@ -235,7 +231,6 @@ func register(w http.ResponseWriter, r *http.Request) {
 	c2.Opts.Url = "http://" + c2.Ip + ":" + c2.Port
 	c2.Opts.Timeout = 1000 * time.Second           //限制连接时长
 	c2.illChannel = make(chan int, defaultRandNum) //当主机health check失败后, 将通知启动的协程不再进行随机测试，自行销毁
-	c2.state = 0                                   //移除?
 
 	//注册新的主机,或者修改旧的主机
 	mMap.Lock()
@@ -273,7 +268,7 @@ func register(w http.ResponseWriter, r *http.Request) {
 			time.Sleep(2 * time.Second)
 		}
 
-		//开启10个goroutine进行随机测试
+		//开启指定数量goroutine进行随机测试
 		for i := 0; i < defaultRandNum; i++ {
 			go func(c Client) {
 				for {
@@ -286,12 +281,12 @@ func register(w http.ResponseWriter, r *http.Request) {
 					default:
 						randTest(c)
 					}
-					//for test
 				}
 			}(c2)
 		}
 	}()
 
+	//
 	msg := appSoarRegistry + ":" + appSoarPort
 	fmt.Fprintf(w, msg)
 	return
@@ -324,8 +319,19 @@ func (c Client) getImages() ([]ClientImageList, error) {
 		log.Debugf("%s: get image fail for %v\n", c.Ip, err)
 		return []ClientImageList{}, errors.New("json unmarshal apiimage fail")
 	}
-
 	return apiImages, nil
+}
+
+func (c Client) shutdown() {
+	resp, err := c.DoAction("/shutdown", Get)
+	if err != nil {
+		log.Debugf("%s: shutdown fail for:%v\n", c.Ip, err)
+	}
+	defer func() {
+		if resp != nil {
+			resp.Body.Close()
+		}
+	}()
 }
 
 func (c Client) pullImage(imgTag string) error {
@@ -357,6 +363,45 @@ func (c Client) pullImage(imgTag string) error {
 	}
 
 	return nil
+
+}
+func (c Client) checkImageExists(imgTag string) (bool, error) {
+
+	log.Debugf("%s pushImage try to push [%s]", c.Ip, imgTag)
+	slice1 := strings.Split(imgTag, ":")
+
+	var img string
+	img = slice1[0]
+	for i := 1; i < len(slice1)-1; i++ {
+		img = img + ":" + slice1[i]
+	}
+
+	tag := slice1[len(slice1)-1]
+	url := "/exists/" + img + "/" + tag
+	resp, err := c.DoAction(url, Get)
+	if err != nil {
+		log.Debugf("%s: fail to check  image[%s] exists for %v\n", c.Ip, imgTag, err)
+		return false, err
+
+	}
+	defer func() {
+		if resp != nil {
+			resp.Body.Close()
+		}
+	}()
+
+	byteContent, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		log.Debugf("%s: fail to check  image[%s] exists for %v\n", c.Ip, imgTag, err)
+		return false, err
+
+	}
+
+	if string(byteContent) == "exists" {
+		return true, nil
+	} else {
+		return false, nil
+	}
 
 }
 
@@ -434,6 +479,7 @@ func (c Client) tagImage(imgTag string, new string) error {
 	return nil
 }
 
+//for test
 func hello(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "hello")
 }
@@ -479,65 +525,77 @@ func (c Client) pullImageFromPublic(imgTag string) error {
 
 func randTest(client Client) error {
 	log.Debugf("%s: start rand test....", client.Ip)
-	if client.state == 0 {
-		lPushedMap := len(pushedMap)
-		if lPushedMap == 0 {
-			log.Debugf("randtest without pushed image")
-			return errors.New("test without pushed image")
+	lPushedMap := len(pushedMap)
+	if lPushedMap == 0 {
+		log.Debugf("randtest without pushed image")
+		return errors.New("test without pushed image")
+	}
+
+	iList := make([]string, lPushedMap)
+	i := 0
+	for j, _ := range pushedMap {
+		iList[i] = j
+		i++
+	}
+	image := iList[rand.Intn(len(iList))]
+
+	k := rand.Intn(len(actions))
+	switch actions[k] {
+	case "push":
+		//tag repository
+		exists, err := client.checkImageExists(image)
+		if err != nil {
+			log.Infof("%s:pushImage fail for check image[%s] exists fail for %v", client.Ip, image, err)
+			return err
 		}
 
-		iList := make([]string, lPushedMap)
-		i := 0
-		for j, _ := range pushedMap {
-			iList[i] = j
-			i++
-		}
-		image := iList[rand.Intn(len(iList))]
-
-		k := rand.Intn(len(actions))
-		switch actions[k] {
-		case "push":
-			//tag repository
-			slice1 := strings.Split(image, ":")
-			tag := slice1[len(slice1)-1]
-
-			newrepo := appSoarRegistry + ":" + appSoarPort + "/" + RandStringRunes(6) + "/" + RandStringRunes(7)
-			log.Infof("%s: is pushint new image[%s:%s]\n", client.Ip, newrepo, tag)
-			err := client.tagImage(image, newrepo+":"+tag)
-			if err != nil {
-				log.Errorf("%s: push new image fail for tag new image[%s ==> %s:%s] fail:%v\n", client.Ip, image, newrepo, tag, err)
-				return err
-			}
-
-			err = client.pushImage(newrepo + ":" + tag)
-			if err != nil {
-				log.Errorf("%s: push new image[%s:%s] fail:%v\n", client.Ip, newrepo, tag, err)
-				return err
-			} else {
-				log.Infof("%s: push new image[%s:%s] success\n", client.Ip, newrepo, tag)
-
-			}
-			pMap.Lock()
-			pushedMap[newrepo+":"+tag] = 1
-			pMap.Unlock()
-		case "pull":
-			log.Infof("%s: is pulling image:%s", client.Ip, image)
+		if !exists {
 			err := client.pullImage(image)
 			if err != nil {
-				log.Errorf("%s: pull image[%s] fail: %v\n", client.Ip, image, err)
-			} else {
-				log.Infof("%s: pull image[%s] success\n", client.Ip, image)
-			}
+				log.Infof("%s:pushImage fail for pull nonexist image[%s] for %v", client.Ip, image, err)
+				return err
 
-		default:
-			log.Errorf("%s:invalid action", client.Ip)
+			}
 		}
+
+		slice1 := strings.Split(image, ":")
+		tag := slice1[len(slice1)-1]
+
+		newrepo := appSoarRegistry + ":" + appSoarPort + "/" + RandStringRunes(6) + "/" + RandStringRunes(7)
+		log.Infof("%s: is pushint new image[%s:%s]\n", client.Ip, newrepo, tag)
+		err = client.tagImage(image, newrepo+":"+tag)
+		if err != nil {
+			log.Errorf("%s: push new image fail for tag new image[%s ==> %s:%s] fail:%v\n", client.Ip, image, newrepo, tag, err)
+			return err
+		}
+
+		err = client.pushImage(newrepo + ":" + tag)
+		if err != nil {
+			log.Errorf("%s: push new image[%s:%s] fail:%v\n", client.Ip, newrepo, tag, err)
+			return err
+		} else {
+			log.Infof("%s: push new image[%s:%s] success\n", client.Ip, newrepo, tag)
+		}
+		pMap.Lock()
+		pushedMap[newrepo+":"+tag] = 1
+		pMap.Unlock()
+	case "pull":
+		log.Infof("%s: is pulling image:%s", client.Ip, image)
+		err := client.pullImage(image)
+		if err != nil {
+			log.Errorf("%s: pull image[%s] fail: %v\n", client.Ip, image, err)
+		} else {
+			log.Infof("%s: pull image[%s] success\n", client.Ip, image)
+		}
+
+	default:
+		log.Errorf("%s:invalid action", client.Ip)
 	}
 	return nil
 }
 
 func healthCheck(c Client) {
-	Timeout := time.Duration(3 * time.Second)
+	Timeout := time.Duration(1 * time.Second)
 	client := &http.Client{Timeout: Timeout}
 
 	req, err := http.NewRequest(Get.Name, "http://"+c.Ip+":"+c.Port+"/ping", nil)
@@ -590,6 +648,7 @@ func NewRegisryClient() *RegistryClient {
 
 }
 
+//获取指定长度的随机字符串
 func RandStringRunes(n int) string {
 	b := make([]rune, n)
 	for i := range b {
@@ -600,17 +659,15 @@ func RandStringRunes(n int) string {
 
 func init() {
 
-	log.Level = logrus.DebugLevel
+	//	log.Level = logrus.DebugLevel
 	rand.Seed(time.Now().Unix())
 
-	//flag.StringVar(&appSoarRegistry, "rip", "192.168.15.119", "registry ip")
-	//flag.StringVar(&appSoarPort, "rport", "5000", "registry port")
-	//flag.StringVar(&RegisterListenPort, "lport", "12345", "register server listen port")
 	flag.StringVar(&appSoarRegistry, "rip", "", "registry ip")
 	flag.StringVar(&appSoarPort, "rport", "", "registry port")
 	flag.StringVar(&RegisterListenPort, "lport", "", "register server listen port")
 	var logFile string
 	flag.StringVar(&logFile, "log", "./autotest.log", "log file path")
+	//flat.intVar(&limitNum,"limit", 1000,"number of test image")
 	flag.Parse()
 	if len(appSoarRegistry) == 0 || len(appSoarPort) == 0 || len(RegisterListenPort) == 0 {
 		panic("invalid argument ")
@@ -657,7 +714,6 @@ func init() {
 }
 
 func main() {
-
 	//	registry healthy check
 	log.Debugf("start registry client, healthCheck\n")
 	registry := NewRegisryClient()
@@ -682,5 +738,9 @@ func main() {
 
 	//阻塞主线程,registry健康监测失败才退出
 	_ = <-registry.illChannel
+	//关闭所有的client
+	for _, j := range clientMap {
+		j.shutdown()
+	}
 	log.Info("registry healthy check fail, exit...")
 }
