@@ -137,7 +137,7 @@ func pushImageExists(c2 client.Client) {
 					}
 				}
 			}
-		} else {
+		} else { //docker hub上拉取的镜像可能增加了docker.io前缀
 			var tmp string
 			if strings.HasPrefix(j.ImageTag, "docker.io/") {
 				tmp = strings.TrimPrefix(j.ImageTag, "docker.io/")
@@ -280,6 +280,7 @@ func pushImageNotExists(c2 client.Client) {
 	}
 }
 
+// 注册控制器
 func register(w http.ResponseWriter, r *http.Request) {
 	log.Infof("%s:start to register ", r.RemoteAddr)
 	vars := mux.Vars(r)
@@ -356,7 +357,7 @@ func register(w http.ResponseWriter, r *http.Request) {
 						runtime.Goexit()
 						//达到Limit,退出
 					default:
-						randTest(c, i)
+						randTest(c)
 					}
 				}
 			}(c2, i)
@@ -369,12 +370,12 @@ func register(w http.ResponseWriter, r *http.Request) {
 	return
 }
 
-//for test
+//健康检查器
 func hello(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "hello")
 }
 
-func randTest(client client.Client, i int) error {
+func randTest(client client.Client) error {
 
 	log.Debugf("%s: start rand test....", client.Ip)
 	pMap.Lock()
@@ -508,16 +509,19 @@ func pushImageCount() {
 		}
 	}
 }
+
+//监测正在工作的测试
 func checkWorking(i int) {
 	for {
+		//所有工作已完成,发送终止信号
 		if working == 0 {
 			limitChan <- i
 		}
 		time.Sleep(50 * time.Microsecond)
 	}
-
 }
 
+//拉取镜像统计
 func pullImageCount() {
 	pullImageCount := 0
 	pullFailCount := 0
@@ -532,7 +536,9 @@ func pullImageCount() {
 			log.Infof("pullCount:%d\n", pullImageCount)
 			if pullImageCount > pullLimit {
 				if stopRandTestSignal == 0 {
+					//设置停止随机测试标志
 					stopRandTestSignal = 1
+					//启动goroutine等待仍在工作的goroutine完成
 					go checkWorking(2)
 				}
 				c.Unlock()
@@ -551,7 +557,6 @@ func pullImageCount() {
 			pullSuccessCount += 1
 			pullLog.Infof("pull[success]:%d,[fail]:%d", pullSuccessCount, pullFailCount)
 			working -= 1
-			//		recordLog.Infof("pull[success]:%d", pullSuccessCount)
 		default:
 			log.Errorf("pullImageCount invalid couthNum %d", i)
 		}
