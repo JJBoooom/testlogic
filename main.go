@@ -48,7 +48,6 @@ var (
 	appSoarPort        string
 	RegisterListenPort string
 	//repo名只支持小写, 用于随机产生repo名
-	letterRunes        = []rune("abcdefghijklmnopqrstuvwxyz")
 	pullLimit          int
 	pushLimit          int
 	countPullChan      = make(chan int) //负责统计pushed image
@@ -58,14 +57,11 @@ var (
 	LoginPassword      string
 	LoginServer        string
 	Debug              bool
-	testCase           string
+	workingPushChan    = make(chan int)
+	workingPullChan    = make(chan int)
+	stopRandTestSignal int
 	working            int
-	workingChan        = make(chan int)
-	stopRandTestSignal = make(chan int)
-
-//	stateMap      = make([]int, defaultRandNum)
-
-// 1 - working, 2 - free
+	workingDone        = make(chan int)
 )
 
 //镜像列表
@@ -349,6 +345,9 @@ func register(w http.ResponseWriter, r *http.Request) {
 		for i := 0; i < defaultRandNum; i++ {
 			go func(c client.Client, i int) {
 				for {
+					if stopRandTestSignal == 1 {
+						runtime.Goexit()
+					}
 					select {
 					case _ = <-c.IllChannel:
 						mMap.Lock()
@@ -356,8 +355,6 @@ func register(w http.ResponseWriter, r *http.Request) {
 						mMap.Unlock()
 						runtime.Goexit()
 						//达到Limit,退出
-					case _ = <-stopRandTestSignal:
-						runtime.Goexit()
 					default:
 						randTest(c, i)
 					}
@@ -402,9 +399,8 @@ func randTest(client client.Client, i int) error {
 	k := rand.Intn(len(actions))
 	switch actions[k] {
 	case "push":
-		//tag repository
-		workingChan <- 1
 		countPushChan <- 0
+		_ = <-workingPushChan
 		exists, err := client.CheckImageExists(image)
 		if err != nil {
 			countPushChan <- 1
@@ -449,10 +445,11 @@ func randTest(client client.Client, i int) error {
 		pMap.Lock()
 		pushedMap[newrepo+":"+tag] = 1
 		pMap.Unlock()
-		workingChan <- -1
+		//workingChan <- -1
 	case "pull":
-		workingChan <- 1
+		//workingChan <- 1
 		countPullChan <- 0
+		_ = <-workingPullChan
 		log.Infof("%s: is pulling image:%s", client.Ip, image)
 		err := client.PullImage(image)
 		if err != nil {
@@ -462,7 +459,6 @@ func randTest(client client.Client, i int) error {
 			countPullChan <- 2
 			log.Infof("%s: pull image[%s] success\n", client.Ip, image)
 		}
-		workingChan <- -1
 
 	default:
 		log.Errorf("%s:invalid action", client.Ip)
@@ -474,62 +470,97 @@ func pushImageCount() {
 	pushImageCount := 0
 	pushFailCount := 0
 	pushSuccessCount := 0
+	c := new(sync.Mutex)
 	//pullFailCount := 0
 	//pullSuccessCount := 0
 	for {
-		select {
-		case i := <-countPushChan: // 0 - 统计, 1 - 失败统计, 2 - 成功统计
-			switch i {
-			case 0:
-				pushImageCount += 1
-				log.Infof("pushCount:%d\n", pushImageCount)
-				if pushImageCount > pushLimit {
-					limitChan <- 1
+		i := <-countPushChan // 0 - 统计, 1 - 失败统计, 2 - 成功统计
+		switch i {
+		case 0:
+			c.Lock()
+			pushImageCount += 1
+			log.Infof("pushCount:%d\n", pushImageCount)
+			if pushImageCount > pushLimit {
+				if stopRandTestSignal == 0 {
+					stopRandTestSignal = 1
+					go checkWorking(1)
 				}
-			case 1:
-				pushFailCount += 1
-				pushLog.Infof("push[success]:%d,[fail]:%d", pushSuccessCount, pushFailCount)
-			//	recordLog.Infof("push[fail]:%d", pushFailCount)
-			case 2:
-				pushSuccessCount += 1
-				pushLog.Infof("push[success]:%d,[fail]:%d", pushSuccessCount, pushFailCount)
-			default:
-				log.Errorf("pushImageCount invalid couthNum %d", i)
+				c.Unlock()
+				continue
+				//limitChan <- 1
+				//因为没有workingPushChan传递信号,routine都会阻塞,
+				//不会继续执行
 			}
+			c.Unlock()
+			working += 1
+			workingPushChan <- 1
+		case 1:
+			pushFailCount += 1
+			pushLog.Infof("push[success]:%d,[fail]:%d", pushSuccessCount, pushFailCount)
+			working -= 1
+		//	recordLog.Infof("push[fail]:%d", pushFailCount)
+		case 2:
+			pushSuccessCount += 1
+			pushLog.Infof("push[success]:%d,[fail]:%d", pushSuccessCount, pushFailCount)
+			working -= 1
+		default:
+			log.Errorf("pushImageCount invalid couthNum %d", i)
 		}
 	}
+}
+func checkWorking(i int) {
+	for {
+		if working == 0 {
+			limitChan <- i
+		}
+		time.Sleep(50 * time.Microsecond)
+	}
+
 }
 
 func pullImageCount() {
 	pullImageCount := 0
 	pullFailCount := 0
 	pullSuccessCount := 0
+	c := new(sync.Mutex)
 	for {
-		select {
-		case i := <-countPullChan:
-			switch i {
-			case 0:
-				pullImageCount += 1
-				log.Infof("pullCount:%d\n", pullImageCount)
-				if pullImageCount > pullLimit {
-					limitChan <- 2
+		i := <-countPullChan
+		switch i {
+		case 0:
+			c.Lock()
+			pullImageCount += 1
+			log.Infof("pullCount:%d\n", pullImageCount)
+			if pullImageCount > pullLimit {
+				if stopRandTestSignal == 0 {
+					stopRandTestSignal = 1
+					go checkWorking(2)
 				}
-			case 1:
-				pullFailCount += 1
-				pullLog.Infof("pull[success]:%d,[fail]:%d", pullSuccessCount, pullFailCount)
-			case 2:
-				pullSuccessCount += 1
-				pullLog.Infof("pull[success]:%d,[fail]:%d", pullSuccessCount, pullFailCount)
-				//		recordLog.Infof("pull[success]:%d", pullSuccessCount)
-			default:
-				log.Errorf("pullImageCount invalid couthNum %d", i)
+				c.Unlock()
+
+				continue
+				//	limitChan <- 2
 			}
+			c.Unlock()
+			working += 1
+			workingPullChan <- 1
+		case 1:
+			pullFailCount += 1
+			pullLog.Infof("pull[success]:%d,[fail]:%d", pullSuccessCount, pullFailCount)
+			working -= 1
+		case 2:
+			pullSuccessCount += 1
+			pullLog.Infof("pull[success]:%d,[fail]:%d", pullSuccessCount, pullFailCount)
+			working -= 1
+			//		recordLog.Infof("pull[success]:%d", pullSuccessCount)
+		default:
+			log.Errorf("pullImageCount invalid couthNum %d", i)
 		}
 	}
 }
 
 //获取指定长度的随机字符串
 func RandStringRunes(n int) string {
+	letterRunes := []rune("abcdefghijklmnopqrstuvwxyz")
 	b := make([]rune, n)
 	for i := range b {
 		b[i] = letterRunes[rand.Intn(len(letterRunes))]
@@ -629,10 +660,11 @@ func init() {
 }
 
 func calCounting() {
-	i := <-workingChan
-	working += i
-	if working == 0 {
-		limitChan <- 3
+
+	for {
+		if working == 0 {
+			workingDone <- 1
+		}
 	}
 
 }
@@ -672,12 +704,6 @@ func main() {
 		}
 	}()
 
-	//阻塞主线程,registry健康监测失败才退出
-	var pushLimitSignal int
-	var pullLimitSignal int
-	pushLimitSignal++
-	pullLimitSignal++
-	workingSignal := 0
 	for {
 		select {
 		case _ = <-registry.IllChannel:
@@ -688,44 +714,18 @@ func main() {
 			log.Info("registry healthy check fail, exit...")
 			os.Exit(1)
 
-		case w := <-limitChan: //1 push 2 pull 3 working
+		case w := <-limitChan: //1 push 2 pull
+
+			for _, j := range clientMap {
+				j.Shutdown()
+			}
 			switch w {
 			case 1:
-				pushLimitSignal += 1
-				//确定是否已无正在工作的goroutine
-				if workingSignal == 1 {
-					log.Infof("push images num exceed limit:%d\n ", pushLimit)
-					for _, j := range clientMap {
-						j.Shutdown()
-					}
-					os.Exit(0)
-				} else {
-					//已达上限,通知新完成randtest的goroutine退出
-					stopRandTestSignal <- 1
-				}
+				log.Infof("push reach limit: %d\n", pushLimit)
+				os.Exit(0)
 			case 2:
-				pullLimitSignal += 1
-				if workingSignal == 1 {
-					log.Infof("pull images num exceed limit:%d\n ", pullLimit)
-					for _, j := range clientMap {
-						j.Shutdown()
-					}
-					os.Exit(0)
-				} else {
-					stopRandTestSignal <- 1
-				}
-			case 3:
-				if pullLimitSignal != 0 || pushLimitSignal != 0 {
-					for _, j := range clientMap {
-						j.Shutdown()
-					}
-					if pullLimitSignal != 0 {
-						log.Infof("pull images num exceed limit:%d\n ", pullLimit)
-					} else {
-						log.Infof("push images num exceed limit:%d\n ", pushLimit)
-					}
-					os.Exit(0)
-				}
+				log.Infof("pull reach limit: %d\n", pullLimit)
+				os.Exit(0)
 			}
 		}
 	}
