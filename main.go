@@ -17,8 +17,8 @@ import (
 
 	"math/rand"
 
-	"github.com/Sirupsen/logrus"
-	"github.com/gorilla/mux"
+	"logic/Godeps/_workspace/src/github.com/Sirupsen/logrus"
+	"logic/Godeps/_workspace/src/github.com/gorilla/mux"
 )
 
 const (
